@@ -103,6 +103,10 @@ CLIENT_DISCONNECT_TIMEOUT: Final = 10.0
 
 UNAVAILABLE_TRACK_SECONDS: Final = 60 * 5
 
+# How often devices with an unavailable factor (async_set_unavailable_factor)
+# are checked against factor x their learned advertising interval.
+FAST_UNAVAILABLE_TRACK_SECONDS: Final = 5
+
 
 # AUTO scanning mode: each scanner gets its first sweep
 # AUTO_INITIAL_SWEEP_DELAY after joining, then every

@@ -43,6 +43,7 @@ from .const import (
     DURABLY_GONE_STALE_FACTOR,
     FAILED_ADAPTER_MAC,
     FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS,
+    FAST_UNAVAILABLE_TRACK_SECONDS,
     MIN_ACTIVE_SCAN_DURATION,
     MIN_ACTIVE_SCAN_INTERVAL,
     RESCUE_SCAN_RETRY_SECONDS,
@@ -167,6 +168,7 @@ class BluetoothManager:
         "_bleak_callbacks",
         "_bluetooth_adapters",
         "_cancel_allocation_callbacks",
+        "_cancel_fast_unavailable_tracking",
         "_cancel_unavailable_tracking",
         "_connectable_history",
         "_connectable_scanners",
@@ -177,6 +179,7 @@ class BluetoothManager:
         "_disappeared_callbacks",
         "_fallback_intervals",
         "_intervals",
+        "_last_heard",
         "_loop",
         "_mgmt_ctl",
         "_name_cache",
@@ -190,6 +193,7 @@ class BluetoothManager:
         "_sources",
         "_subclass_discover_info",
         "_unavailable_callbacks",
+        "_unavailable_factors",
         "_warned_passive_active_scan",
         "has_advertising_side_channel",
         "shutdown",
@@ -203,6 +207,11 @@ class BluetoothManager:
     ) -> None:
         """Init bluetooth manager."""
         self._cancel_unavailable_tracking: asyncio.TimerHandle | None = None
+        self._cancel_fast_unavailable_tracking: asyncio.TimerHandle | None = None
+        # address -> factor, set by async_set_unavailable_factor, and the
+        # time any scanner last heard each of those addresses.
+        self._unavailable_factors: dict[str, float] = {}
+        self._last_heard: dict[str, float] = {}
 
         self._advertisement_tracker = AdvertisementTracker()
         self._fallback_intervals = self._advertisement_tracker.fallback_intervals
@@ -478,6 +487,9 @@ class BluetoothManager:
         if self._cancel_unavailable_tracking:
             self._cancel_unavailable_tracking.cancel()
             self._cancel_unavailable_tracking = None
+        if self._cancel_fast_unavailable_tracking:
+            self._cancel_fast_unavailable_tracking.cancel()
+            self._cancel_fast_unavailable_tracking = None
         self._auto_scheduler.stop()
         if self._background_tasks:
             # The cancel is fire and forget; log here so an unregister that
@@ -519,6 +531,7 @@ class BluetoothManager:
     def async_setup_unavailable_tracking(self) -> None:
         """Set up the unavailable tracking."""
         self._schedule_unavailable_tracking()
+        self._schedule_fast_unavailable_tracking()
 
     def _schedule_unavailable_tracking(self) -> None:
         """Schedule the unavailable tracking."""
@@ -528,6 +541,40 @@ class BluetoothManager:
         self._cancel_unavailable_tracking = loop.call_at(
             loop.time() + UNAVAILABLE_TRACK_SECONDS, self._async_check_unavailable
         )
+
+    def _schedule_fast_unavailable_tracking(self) -> None:
+        """Schedule the check of devices with an unavailable factor."""
+        if TYPE_CHECKING:
+            assert self._loop is not None
+        loop = self._loop
+        self._cancel_fast_unavailable_tracking = loop.call_at(
+            loop.time() + FAST_UNAVAILABLE_TRACK_SECONDS,
+            self._async_check_fast_unavailable,
+        )
+
+    def _async_check_fast_unavailable(self) -> None:
+        """
+        Mark devices with an unavailable factor unavailable once overdue.
+
+        A device is overdue when no scanner has heard it for its factor times
+        its learned advertising interval. This runs beside the sweep and does
+        not replace it: a device with no learned interval, or one that is
+        not overdue, waits for the sweep as before.
+        """
+        if self._unavailable_factors:
+            monotonic_now = monotonic_time_coarse()
+            intervals = self._intervals
+            all_history = self._all_history
+            last_heard = self._last_heard
+            for address, factor in list(self._unavailable_factors.items()):
+                if (
+                    address in all_history
+                    and (interval := intervals.get(address))
+                    and (heard := last_heard.get(address)) is not None
+                    and monotonic_now - heard > interval * factor
+                ):
+                    self._async_mark_address_unavailable(address)
+        self._schedule_fast_unavailable_tracking()
 
     def _async_check_unavailable(self) -> None:
         """Watch for unavailable devices and cleanup state history."""
@@ -595,7 +642,13 @@ class BluetoothManager:
         time_since_seen = monotonic_now - all_history[address].time
         if time_since_seen <= advertising_interval:
             return False
+        self._async_mark_address_unavailable(address)
+        return True
 
+    def _async_mark_address_unavailable(self, address: str) -> None:
+        """Remove a non-connectable device's state and fire its callbacks."""
+        all_history = self._all_history
+        tracker = self._advertisement_tracker
         # The non-connectable check is responsible for removing
         # the device from all the interval tracking since it is no longer
         # available for both connectable and non-connectable
@@ -619,7 +672,6 @@ class BluetoothManager:
                     callback(service_info)
                 except Exception:  # pylint: disable=broad-except
                     _LOGGER.exception("Error in unavailable callback")
-        return True
 
     def _address_disappeared(self, address: str) -> None:
         """
@@ -1155,6 +1207,13 @@ class BluetoothManager:
             callbacks := self._advertisement_callbacks.get(service_info.address)
         ):
             self._dispatch_advertisement_callbacks(callbacks, service_info)
+        # Devices with an unavailable factor are timed from the newest
+        # advertisement from any scanner, not only the one that owns them.
+        if (
+            self._unavailable_factors
+            and service_info.address in self._unavailable_factors
+        ):
+            self._last_heard[service_info.address] = service_info.time
 
         # Cross-scanner name cache. Only the steady-state identity check
         # is inlined here because this code runs on every advertisement
@@ -2004,6 +2063,30 @@ class BluetoothManager:
     def async_allocate_connection_slot(self, device: BLEDevice) -> bool:
         """Allocate a connection slot."""
         return self.slot_manager.allocate_slot(device)
+
+    def async_set_unavailable_factor(self, address: str, factor: float | None) -> None:
+        """
+        Mark a non-connectable device unavailable sooner, or stop doing so.
+
+        Once set, the device is marked unavailable when no scanner has heard
+        it for factor times its learned advertising interval, checked every
+        FAST_UNAVAILABLE_TRACK_SECONDS. Without it, a device is marked
+        unavailable only after every scanner has expired it and the next
+        sweep runs. None clears it. It is kept when the device goes
+        unavailable, and has no effect until an interval is learned.
+        """
+        if factor is None:
+            self._unavailable_factors.pop(address, None)
+            self._last_heard.pop(address, None)
+            return
+        if not math.isfinite(factor) or factor <= 1.0:
+            msg = "factor must be a finite number greater than 1"
+            raise ValueError(msg)
+        self._unavailable_factors[address] = factor
+
+    def async_get_unavailable_factor(self, address: str) -> float | None:
+        """Get the unavailable factor for a MAC address."""
+        return self._unavailable_factors.get(address)
 
     def async_get_learned_advertising_interval(self, address: str) -> float | None:
         """Get the learned advertising interval for a MAC address."""
